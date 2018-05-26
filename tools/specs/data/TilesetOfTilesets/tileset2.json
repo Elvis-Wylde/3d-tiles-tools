@@ -1,6 +1,6 @@
 {
   "asset": {
-    "version": "0.0"
+    "version": "1.0"
   },
   "geometricError": 70,
   "root": {
@@ -15,6 +15,7 @@
       ]
     },
     "geometricError": 70,
+    "refine": "ADD",
     "content": {
       "url": "parent.b3dm"
     },
@@ -31,7 +32,6 @@
           ]
         },
         "geometricError": 0,
-        "refine": "add",
         "content": {
           "url": "tileset3/tileset3.json"
         }

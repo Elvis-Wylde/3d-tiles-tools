@@ -7,23 +7,22 @@ var path = require('path');
 var Promise = require('bluebird');
 var yargs = require('yargs');
 var zlib = require('zlib');
+var databaseToTileset = require('../lib/databaseToTileset');
 var directoryExists = require('../lib/directoryExists');
 var extractB3dm = require('../lib/extractB3dm');
 var extractCmpt = require('../lib/extractCmpt');
 var extractI3dm = require('../lib/extractI3dm');
 var fileExists = require('../lib/fileExists');
 var getBufferPadded = require('../lib/getBufferPadded');
+var getMagic = require('../lib/getMagic');
 var getJsonBufferPadded = require('../lib/getJsonBufferPadded');
 var glbToB3dm = require('../lib/glbToB3dm');
 var glbToI3dm = require('../lib/glbToI3dm');
 var isGzipped = require('../lib/isGzipped');
 var optimizeGlb = require('../lib/optimizeGlb');
 var runPipeline = require('../lib/runPipeline');
-var tileset2sqlite3 = require('../lib/tileset2sqlite3');
+var tilesetToDatabase = require('../lib/tilesetToDatabase');
 
-var fsExtraReadJson = Promise.promisify(fsExtra.readJson);
-var fsReadFile = Promise.promisify(fsExtra.readFile);
-var fsWriteFile = Promise.promisify(fsExtra.outputFile);
 var zlibGunzip = Promise.promisify(zlib.gunzip);
 var zlibGzip = Promise.promisify(zlib.gzip);
 
@@ -81,7 +80,8 @@ var argv = yargs
         }
     })
     .command('pipeline', 'Execute the input pipeline JSON file.')
-    .command('tileset2sqlite3', 'Create a sqlite database for a tileset.')
+    .command('tilesetToDatabase', 'Create a sqlite database for a tileset.')
+    .command('databaseToTileset', 'Unpack a tileset database to a tileset folder.')
     .command('glbToB3dm', 'Repackage the input glb as a b3dm with a basic header.')
     .command('glbToI3dm', 'Repackage the input glb as a i3dm with a basic header.')
     .command('b3dmToGlb', 'Extract the binary glTF asset from the input b3dm.')
@@ -106,6 +106,16 @@ var argv = yargs
         }
     })
     .command('ungzip', 'Ungzips the input tileset directory.')
+    .command('combine', 'Combines all external tilesets into a single tileset.json file.', {
+        'r': {
+            alias: 'rootJson',
+            default: 'tileset.json',
+            description: 'Relative path to the root tileset.json file.',
+            normalize: true,
+            type: 'string'
+        }
+    })
+    .command('upgrade', 'Upgrades the input tileset to the latest version of the 3D Tiles spec. Embedded glTF models will be upgraded to glTF 2.0.')
     .demand(1)
     .recommendCommands()
     .strict()
@@ -137,6 +147,10 @@ function runCommand(command, input, output, force, argv) {
         return processStage(input, output, force, command, argv);
     } else if (command === 'ungzip') {
         return processStage(input, output, force, command, argv);
+    } else if (command === 'combine') {
+        return processStage(input, output, force, command, argv);
+    } else if (command === 'upgrade') {
+        return processStage(input, output, force, command, argv);
     } else if (command === 'b3dmToGlb') {
         return readB3dmWriteGlb(input, output, force);
     } else if (command === 'i3dmToGlb') {
@@ -151,41 +165,40 @@ function runCommand(command, input, output, force, argv) {
         return readAndOptimizeB3dm(input, output, force, optionArgs);
     } else if (command === 'optimizeI3dm') {
         return readAndOptimizeI3dm(input, output, force, optionArgs);
-    } else if (command === 'tileset2sqlite3') {
-        return tilesetToSqlite3(input, output, force);
-    } else {
-        throw new DeveloperError('Invalid command: ' + command);
+    } else if (command === 'tilesetToDatabase') {
+        return convertTilesetToDatabase(input, output, force);
+    } else if (command === 'databaseToTileset') {
+        return convertDatabaseToTileset(input, output, force);
     }
+    throw new DeveloperError('Invalid command: ' + command);
 }
 
 function checkDirectoryOverwritable(directory, force) {
     if (force) {
         return Promise.resolve();
-    } else {
-        return directoryExists(directory)
-            .then(function(exists) {
-                if (exists) {
-                    throw new DeveloperError('Directory ' + directory + ' already exists. Specify -f or --force to overwrite existing files.');
-                }
-            });
     }
+    return directoryExists(directory)
+        .then(function(exists) {
+            if (exists) {
+                throw new DeveloperError('Directory ' + directory + ' already exists. Specify -f or --force to overwrite existing files.');
+            }
+        });
 }
 
 function checkFileOverwritable(file, force) {
     if (force) {
         return Promise.resolve();
-    } else {
-        return fileExists(file)
-            .then(function (exists) {
-                if (exists) {
-                    throw new DeveloperError('File ' + file + ' already exists. Specify -f or --force to overwrite existing files.');
-                }
-            });
     }
+    return fileExists(file)
+        .then(function (exists) {
+            if (exists) {
+                throw new DeveloperError('File ' + file + ' already exists. Specify -f or --force to overwrite existing files.');
+            }
+        });
 }
 
 function readFile(file) {
-    return fsReadFile(file)
+    return fsExtra.readFile(file)
         .then(function(fileBuffer) {
             if (isGzipped(fileBuffer)) {
                 return zlibGunzip(fileBuffer);
@@ -199,7 +212,7 @@ function logCallback(message) {
 }
 
 function processPipeline(inputFile) {
-    return fsExtraReadJson(inputFile)
+    return fsExtra.readJson(inputFile)
         .then(function(pipeline) {
             var inputDirectory = pipeline.input;
             var outputDirectory = pipeline.output;
@@ -256,15 +269,25 @@ function getStage(stageName, argv) {
         case 'gzip':
             stage.tilesOnly = argv.tilesOnly;
             break;
+        case 'combine':
+            stage.rootJson = argv.rootJson;
     }
     return stage;
 }
 
-function tilesetToSqlite3(inputDirectory, outputPath, force) {
+function convertTilesetToDatabase(inputDirectory, outputPath, force) {
     outputPath = defaultValue(outputPath, path.join(path.dirname(inputDirectory), path.basename(inputDirectory) + '.3dtiles'));
     return checkFileOverwritable(outputPath, force)
         .then(function() {
-            return tileset2sqlite3(inputDirectory, outputPath);
+            return tilesetToDatabase(inputDirectory, outputPath);
+        });
+}
+
+function convertDatabaseToTileset(inputPath, outputDirectory, force) {
+    outputDirectory = defaultValue(outputDirectory, path.join(path.dirname(inputPath), path.basename(inputPath, path.extname(inputPath))));
+    return checkDirectoryOverwritable(outputDirectory, force)
+        .then(function() {
+            return databaseToTileset(inputPath, outputDirectory);
         });
 }
 
@@ -274,7 +297,11 @@ function readGlbWriteB3dm(inputPath, outputPath, force) {
         .then(function() {
             return readFile(inputPath)
                 .then(function(glb) {
-                    return fsWriteFile(outputPath, glbToB3dm(glb));
+                    // Set b3dm spec requirements
+                    var featureTableJson = {
+                        BATCH_LENGTH : 0
+                    };
+                    return fsExtra.outputFile(outputPath, glbToB3dm(glb, featureTableJson));
                 });
         });
 }
@@ -285,17 +312,17 @@ function readGlbWriteI3dm(inputPath, outputPath, force) {
         .then(function() {
             return readFile(inputPath)
                 .then(function(glb) {
-                    // Set I3dm spec requirements
+                    // Set i3dm spec requirements
                     var featureTable = {
                         INSTANCES_LENGTH : 1,
                         POSITION : {
                             byteOffset : 0
                         }
                     };
-                    var featureTableJSONBuffer = getJsonBufferPadded(featureTable);
+                    var featureTableJsonBuffer = getJsonBufferPadded(featureTable);
                     var featureTableBinaryBuffer = getBufferPadded(Buffer.alloc(12, 0)); // [0, 0, 0]
 
-                    return fsWriteFile(outputPath, glbToI3dm(glb, featureTableJSONBuffer, featureTableBinaryBuffer));
+                    return fsExtra.outputFile(outputPath, glbToI3dm(glb, featureTableJsonBuffer, featureTableBinaryBuffer));
                 });
         });
 }
@@ -307,7 +334,7 @@ function readB3dmWriteGlb(inputPath, outputPath, force) {
             return readFile(inputPath);
         })
         .then(function(b3dm) {
-            return fsWriteFile(outputPath, extractB3dm(b3dm).glb);
+            return fsExtra.outputFile(outputPath, extractB3dm(b3dm).glb);
         });
 }
 
@@ -318,7 +345,7 @@ function readI3dmWriteGlb(inputPath, outputPath, force) {
             return readFile(inputPath);
         })
         .then(function(i3dm) {
-            return fsWriteFile(outputPath, extractI3dm(i3dm).glb);
+            return fsExtra.outputFile(outputPath, extractI3dm(i3dm).glb);
         });
 }
 
@@ -327,7 +354,7 @@ function extractGlbs(tiles) {
     var tilesLength = tiles.length;
     for (var i = 0; i < tilesLength; ++i) {
         var tile = tiles[i];
-        var magic = tile.toString('utf8', 0, 4);
+        var magic = getMagic(tile);
         if (magic === 'i3dm') {
             glbs.push(extractI3dm(tile).glb);
         } else if (magic === 'b3dm') {
@@ -348,7 +375,7 @@ function readCmptWriteGlb(inputPath, outputPath, force) {
             if (glbsLength === 0) {
                 throw new DeveloperError('No glbs found in ' + inputPath + '.');
             } else if (glbsLength === 1) {
-                glbPaths[0] = [outputPath + '.glb'];
+                glbPaths[0] = outputPath + '.glb';
             } else {
                 for (var i = 0; i < glbsLength; ++i) {
                     glbPaths[i] = outputPath + '_' + i + '.glb';
@@ -358,7 +385,7 @@ function readCmptWriteGlb(inputPath, outputPath, force) {
                 return checkFileOverwritable(glbPath, force);
             }).then(function() {
                 return Promise.map(glbPaths, function(glbPath, index) {
-                    return fsWriteFile(glbPath, glbs[index]);
+                    return fsExtra.outputFile(glbPath, glbs[index]);
                 });
             });
         });
@@ -371,7 +398,7 @@ function readAndOptimizeB3dm(inputPath, outputPath, force, optionArgs) {
     var b3dm;
     return checkFileOverwritable(outputPath, force)
         .then(function() {
-            return fsReadFile(inputPath);
+            return fsExtra.readFile(inputPath);
         })
         .then(function(fileBuffer) {
             gzipped = isGzipped(fileBuffer);
@@ -385,14 +412,14 @@ function readAndOptimizeB3dm(inputPath, outputPath, force, optionArgs) {
             return optimizeGlb(b3dm.glb, options);
         })
         .then(function(glbBuffer) {
-            var b3dmBuffer = glbToB3dm(glbBuffer, b3dm.batchTable.json, b3dm.batchTable.binary, b3dm.header.batchLength);
+            var b3dmBuffer = glbToB3dm(glbBuffer, b3dm.featureTable.json, b3dm.featureTable.binary, b3dm.batchTable.json, b3dm.batchTable.binary);
             if (gzipped) {
                 return zlibGzip(b3dmBuffer);
             }
             return b3dmBuffer;
         })
         .then(function(buffer) {
-            return fsWriteFile(outputPath, buffer);
+            return fsExtra.outputFile(outputPath, buffer);
         });
 }
 
@@ -403,7 +430,7 @@ function readAndOptimizeI3dm(inputPath, outputPath, force, optionArgs) {
     var i3dm;
     return checkFileOverwritable(outputPath, force)
         .then(function() {
-            return fsReadFile(inputPath);
+            return fsExtra.readFile(inputPath);
         })
         .then(function(fileBuffer) {
             gzipped = isGzipped(fileBuffer);
@@ -424,6 +451,6 @@ function readAndOptimizeI3dm(inputPath, outputPath, force, optionArgs) {
             return i3dmBuffer;
         })
         .then(function(buffer) {
-            return fsWriteFile(outputPath, buffer);
+            return fsExtra.outputFile(outputPath, buffer);
         });
 }
